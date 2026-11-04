@@ -76,14 +76,17 @@ all_online_cpus() {
 }
 
 resolve_cpus() {
-  # $1 = user list (possibly empty) -> echoes a validated, sorted list
+  # $1 = user list (possibly empty) -> echoes a validated, sorted list.
+  # Returns non-zero on bad input so callers can exit even though the list is
+  # captured via command substitution (where exit only leaves the subshell).
   local list="$1" c
   [ -z "$list" ] && list=$(all_online_cpus)
   for c in $list; do
-    [[ "$c" =~ ^[0-9]+$ ]] || die "invalid CPU number: $c"
-    [ -d "$(cpu_dir "$c")" ] || die "cpu$c does not exist"
+    [[ "$c" =~ ^[0-9]+$ ]] || { echo "error: invalid CPU number: $c" >&2; return 2; }
+    [ -d "$(cpu_dir "$c")" ] || { echo "error: cpu$c does not exist" >&2; return 2; }
   done
   echo "$list" | tr ' ' '\n' | sed '/^$/d' | sort -n | tr '\n' ' '
+  return 0
 }
 
 need_root() {
@@ -105,7 +108,7 @@ set_max_freq() {
 
 do_status() {
   local cpus list c core gov epp cur max min
-  list=$(resolve_cpus "$1")
+  list=$(resolve_cpus "$1") || exit $?
   echo "profile=$(powerprofilesctl get 2>/dev/null || echo n/a)   no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo n/a)"
   printf "%-4s %-5s %-7s %-7s %-7s %-6s %-8s %-12s\n" \
     cpu core online max cur hwmin governor epp
@@ -123,8 +126,8 @@ do_status() {
 }
 
 do_cap() {
-  local khz="$1" cpus list c hwmin hwmax val note after fails=0
-  list=$(resolve_cpus "$cpus")
+  local khz="$1" cpus="$2" list c hwmin hwmax val note after fails=0
+  list=$(resolve_cpus "$cpus") || exit $?
   need_root
   for c in $list; do
     hwmax=$(cat "$(freq_file "$c" cpuinfo_max_freq)" 2>/dev/null || echo 0)
@@ -151,8 +154,8 @@ do_cap() {
 }
 
 do_restore() {
-  local cpus list c hwmax after fails=0
-  list=$(resolve_cpus "$cpus")
+  local cpus="$1" list c hwmax after fails=0
+  list=$(resolve_cpus "$cpus") || exit $?
   need_root
   for c in $list; do
     hwmax=$(cat "$(freq_file "$c" cpuinfo_max_freq)" 2>/dev/null || echo 0)
@@ -193,7 +196,7 @@ run_tests() {
 
   ulimit -c 0 2>/dev/null || true
   make_probe
-  list=$(resolve_cpus "$cpus")
+  list=$(resolve_cpus "$cpus") || exit $?
 
   echo "Python: $PYTHON   runs per CPU: $runs"
   echo "Note: core max clocks are read live; a capped core shows its cap."
