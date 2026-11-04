@@ -1,0 +1,10 @@
+# temp probe scripts created by check-cpu-cores.sh
+pyprobe.py
+cpucheck*.py
+
+# log output
+check-cpus.*.log
+
+# shell artifacts
+.DS_Store
+Thumbs.db

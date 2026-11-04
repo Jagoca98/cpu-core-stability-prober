@@ -1,118 +1,129 @@
-# CPU Core Stability Prober
+# cpu-core-stability-prober
 
-Diagnose and manage CPU degradation on Intel Raptor Lake (13th/14th gen) systems where high-boost cores silently corrupt computation at stock frequencies.
+Find the CPU cores that silently corrupt computation. It runs a small,
+self-checking Python workload once per iteration, pinned to one logical CPU at
+a time, and counts the runs that crash instead of printing `ok`.
 
-## The problem
+## Why `stress` misses the fault
 
-Stock tools like `stress` or `stress-ng` don't verify results — they throw away output, so a failing core that returns wrong answers instead of crashing reports nothing. This probe **verifies every run** by importing a known-good Python/setuptools path and checking exit code 0. A corrupted core will SIGSEGV/SIGABRT instead of succeeding.
+Classic `stress` computes `sqrt()` in a tight loop and throws the result away.
+A degraded core that returns wrong answers instead of aborting therefore looks
+perfectly healthy. Running every thread at once also triggers package power
+limits, dropping per-core boost and hiding marginal silicon.
 
-## What is in this directory
+This prober does the opposite: one verified run per core, serially, so the core
+can reach its maximum clock. A core that corrupts execution crashes the
+process (SIGSEGV / SIGABRT / general-protection fault) and is counted as a
+failure.
+
+## What is in this repo
 
 | File | Purpose |
 |------|---------|
-| `check-cpu-cores.sh` | Full per-core stability test with frequency control (cap/restore/show status) |
-| `probe-cpus.py` | Python alternative: live progress bars, ASCII failure chart |
-| `cpu-freq-cap.sh` | Boot-time cap script (called by systemd unit) |
+| `check-cpu-cores.sh` | Per-core stability test plus frequency control (`cap` / `restore` / `status`) |
+| `README.md` | This file |
 
-## Quick start
+Frequency caps set here are **volatile** — they reset on reboot. For a cap that
+survives boot, see the companion service repo `../cpu-freq-fix`.
 
-**Test every online CPU at current frequency:**
+## Usage
+
 ```bash
+# test every online CPU (20 runs per core)
 ./check-cpu-cores.sh
+
+# more confidence, only the two 6.0 GHz preferred cores (4 threads)
+./check-cpu-cores.sh -n 40 -c "8 9 10 11"
+
+# explicit subcommand form (same as default)
+./check-cpu-cores.sh test -n 20
 ```
 
-**Just the two 6.0 GHz cores that tend to fail first:**
-```bash
-./check-cpu-cores.sh -c "8/9/10/11"
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `-n INT` | Runs per CPU. Raise it for confidence on a suspected core. | `20` |
+| `-c "A B C"` | Test only these logical CPUs (space-separated). | all online |
+
+Each iteration forks a fresh Python process pinned with `taskset -c <cpu>`.
+The script prints one row per CPU (core, max GHz, runs, failures, rate, result)
+and exits non-zero if any core failed.
+
+## The probe
+
+Every run executes exactly this code:
+
+```python
+from setuptools.dist import Distribution
+from setuptools._distutils.command.install import install as di
+d = Distribution({'name': 'myprobe', 'version': '0.1'})
+cmd = di(d); cmd.finalize_options(); print('ok')
 ```
 
-**More confidence per core:**
-```bash
-./check-cpu-cores.sh -n 40 -c "8/9/10/11"
-```
+| Step | What happens |
+|------|--------------|
+| `Distribution({...})` | Builds a full package-metadata object in memory: resolves install prefixes, library paths, header directories. Allocates many nested dicts and internal C-level path buffers. |
+| `di(d)` | Constructs the `install` command bound to that distribution. |
+| `cmd.finalize_options()` | Forces every option to resolve at once inside a deep pointer-chasing refcount loop. This is enough memory churn and pointer indirection to trip marginal silicon that pure-register math never touches. |
+| `print('ok')` | Reached only if nothing crashed, so exit code 0 means a clean run. |
 
-Each line of output shows: **cpu | physical-core # | runs | failures | rate | result (OK or FAIL)**. The test runs serially so each core can boost to its maximum clock — parallel testing would lower package turbo and hide the fault.
+A corrupting core dies here with SIGSEGV / GP fault. Pure `sqrt()` loops stay
+in vector registers and never exercise this path, which is why `stress` misses
+the fault.
 
 ## Frequency control
 
-Every CPU has a file `/sys/devices/system/cpu/cpuN/cpufreq/scaling_max_freq` that sets per-core ceiling. Values are in kHz: `4500000 = 4.5 GHz`, `6000000 = 6.0 GHz`.
+Each logical CPU has `/sys/devices/system/cpu/cpuN/cpufreq/scaling_max_freq`
+in kHz. Values: `4500000` = 4.5 GHz, `5500000` = 5.5 GHz, `6000000` = 6.0 GHz.
 
-**Read current limits:**
 ```bash
+# read-only snapshot: max / current / hardware-min clock per CPU
 ./check-cpu-cores.sh status
-./check-cpu-cores.sh status '8/9/10/11'           # just those cores
+./check-cpu-cores.sh status 8 10 11
+
+# set a hard ceiling (needs root)
+sudo ./check-cpu-cores.sh cap 4500000 8 9 10 11
+sudo ./check-cpu-cores.sh cap 4500000            # every online CPU
+
+# back to the stock hardware maximum (needs root)
+sudo ./check-cpu-cores.sh restore 8 9 10 11
+sudo ./check-cpu-cores.sh restore                # every online CPU
 ```
 
-Output shows max, current running clock, and min for each logical CPU. If `max GHz < cpuinfo_max_freq`, the cap is active (`[C]` marker).
+The global turbo switch is `/sys/devices/system/cpu/intel_pstate/no_turbo`
+(`1` = lock all cores to base clock, `0` = turbo on). It is blunt: it affects
+every core, not just the bad one.
 
-**Change frequency caps (requires sudo once):**
+## Finding a safe frequency
+
+Lower the cap in steps and retest until failures disappear.
+
+| Step | Command | What to expect |
+|------|---------|----------------|
+| 1 | `sudo ./check-cpu-cores.sh restore` | Back to the stock ceiling (6 GHz) |
+| 2 | `./check-cpu-cores.sh -n 40 -c "8 9 10 11"` | Failures on the degraded threads |
+| 3 | `sudo ./check-cpu-cores.sh cap 5000000 8 9 10 11` then retest | Fewer failures |
+| 4 | Keep stepping down (4.8, 4.5 GHz) until a run is clean | Clean = usable workaround |
+| 5 | Raise the cap one notch and confirm failures return | Reversibility proves causality |
+
+If a core still fails at the lowest usable frequency, the silicon is degraded
+enough to need replacement (RMA).
+
+## Persistent caps
+
+`scaling_max_freq` resets on every cold boot. To re-apply a cap automatically,
+install the systemd unit from the companion repo `../cpu-freq-fix`:
+
 ```bash
-sudo ./check-cpu-cores.sh cap 4800000 '8/9/10/11'    # set to 4.8 GHz
-sudo ./check-cpu-cores.sh restore                     # back to stock for all online CPUs
-```
-
-Manual alternative (sysfs directly):
-```bash
-echo 4500000 | sudo tee /sys/devices/system/cpu/cpu10/cpufreq/scaling_max_freq
-cat /sys/devices/system/cpu/cpu10/cpufreq/scaling_max_freq    # verify it took
-```
-
-`no_turbo=1` under `/sys/devices/system/cpu/intel_pstate/` clamps all cores to their base clock instead of per-core fine-control. It is a blunt toggle: `1 = turbo off`, `0 = turbo on`.
-
-## The testing pipeline
-
-To find the exact frequency threshold where a core stops failing, lower the cap step-by-step and retest at each level. A complete sweep might look like this:
-
-| Step | Action | What to expect if degraded |
-|------|--------|-----|
-| 1 | `sudo ... restore` | Caps gone, cores back to stock 6.0 GHz |
-| 2 | `./check-cpu-cores.sh -c "8/10" -n 30` | Failures appear on the bad cores |
-| 3 | `sudo ... cap 5000000 '8/9/10/11'` | Cores 8–11 limited to 5.0 GHz |
-| 4 | `./check-cpu-cores.sh -c "8/10" -n 20` | If still failing: lower more |
-| 5 | `sudo ... cap 4700000 '8/9/10/11'` | Try again; keep stepping down until clean |
-
-When failures drop to zero at a given cap, that is your safe operating frequency. Go back one notch higher to confirm it starts failing again — reversibility proves causality.
-
-## Making caps persistent (survive reboot)
-
-Frequency limits are **volatile** — they reset on every power-cycle or cold boot. To keep them after shutdown you need systemd:
-
-```ini
-# /etc/systemd/system/cpu-freq-cap.service
-[Unit]
-Description=Cap max frequency on degraded cores at 4.5 GHz
-After=multi-user.target power-profiles-daemon.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/cpu-freq-cap.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-```
-
-The script `/usr/local/bin/cpu-freq-cap.sh` writes `4500000` into each CPU's `scaling_max_freq`. Activate with:
-```bash
+sudo install -m 755 cpu-freq-cap.sh /usr/local/bin/cpu-freq-cap.sh
+sudo install -m 644 cpu-freq-cap.service /etc/systemd/system/cpu-freq-cap.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now cpu-freq-cap.service
 ```
-
-Remove when ready to test without caps (e.g. during a diagnostic session):
-```bash
-sudo systemctl disable --now cpu-freq-cap.service
-```
-
-## Why `stress` says nothing is wrong
-
-The classic `stress` binary has **no result verification** — it computes `sqrt()` in a tight loop and throws away the output. A degraded core that returns subtly wrong floating-point results will not crash, so the report reads "all good" even though arithmetic was silently corrupted. The same applies when running all 32 cores at once: package power limits drop boost frequency from per-core 6.0 GHz down to ~5.4 GHz, which may mask the defect.
-
-A self-checking test like this one catches the fault reliably because the probe is lightweight (a single import + config call) and verified — if the core corrupts execution in that path it gets `SIGSEGV`.
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | All tested CPUs clean across all runs |
-| 1 | At least one core failed (hardware evidence) |
-| 2 | Usage/setup error (missing taskset, python unavailable, bad CPU #) |
+| `0` | Every tested CPU was clean across all runs |
+| `1` | At least one core failed (hardware evidence) |
+| `2` | Usage or setup error (missing `taskset`, no `python3`, bad CPU number, import failure, write failure) |
