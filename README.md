@@ -120,6 +120,28 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now cpu-freq-cap.service
 ```
 
+## Troubleshooting
+
+If **every** core reports 100% failure, the probe itself is not running — that
+is a setup problem, not hardware. The script runs the probe once before testing
+any core and aborts with the real Python error, and it only counts a run as a
+CPU failure when the process dies from a signal (SIGSEGV 139, SIGABRT 134, …).
+A normal Python exception is reported separately and exits 2.
+
+Reproduce the error by hand:
+
+```bash
+python3 -c 'from setuptools.dist import Distribution; from setuptools._distutils.command.install import install as di; d=Distribution({"name":"x","version":"1"}); c=di(d); c.finalize_options(); print("ok")'
+```
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `ModuleNotFoundError: No module named 'setuptools'` or `..._distutils` | setuptools missing or incomplete for that Python | `sudo apt install python3-setuptools`, or `python3 -m pip install -U setuptools` |
+| `taskset: failed to set pid's affinity: Invalid argument` | CPU is not in the process's allowed set (container, cgroup, VM) | run on the host, or test only allowed CPUs with `-c "0 1 2 3"` |
+| `taskset: command not found` | util-linux missing | `sudo apt install util-linux` |
+| Wrong interpreter (venv/conda) | `python3` resolves elsewhere | `PYTHON=/usr/bin/python3 ./check-cpu-cores.sh` |
+| `_distutils` import error after a setuptools upgrade | setuptools configured to use the stdlib distutils | `SETUPTOOLS_USE_DISTUTILS=local ./check-cpu-cores.sh` |
+
 ## Exit codes
 
 | Code | Meaning |

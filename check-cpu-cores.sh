@@ -44,9 +44,13 @@ set -u
 
 DEFAULT_RUNS=20
 PROBE=""
+ERRFILE=""
 export PYTHON="${PYTHON:-python3}"
 
-cleanup() { [ -n "$PROBE" ] && rm -f "$PROBE"; }
+cleanup() {
+  [ -n "$PROBE" ] && rm -f "$PROBE"
+  [ -n "$ERRFILE" ] && rm -f "$ERRFILE"
+}
 trap cleanup EXIT INT TERM
 
 die() { echo "error: $*" >&2; exit 2; }
@@ -185,9 +189,40 @@ cmd = dist_install(d); cmd.finalize_options(); print('ok')
 PY
 }
 
+# Run the probe once, unpinned, before testing any core. If it cannot even run
+# here, every core would report 100% failure and that would look like broken
+# hardware. Report the real Python error and exit instead.
+probe_selftest() {
+  local rc
+  ERRFILE=$(mktemp "${TMPDIR:-/tmp}/cpucheck.err.XXXXXX") || die "mktemp failed"
+  sh -c '"$1" "$2" 2>"$3"; exit $?' _ "$PYTHON" "$PROBE" "$ERRFILE" \
+    >/dev/null 2>/dev/null
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+
+  if [ "$rc" -lt 128 ]; then
+    # Ordinary non-zero exit: Python/taskset/config error, not a CPU crash.
+    echo "error: the test probe does not run on this Python ($PYTHON)." >&2
+    echo "       This is a setup problem, not a CPU fault." >&2
+    sed 's/^/       /' "$ERRFILE" >&2
+    echo >&2
+    echo "       Try:  $PYTHON -c 'import setuptools, sys; print(sys.version)'" >&2
+    echo "       and:  $PYTHON -c 'from setuptools._distutils.command.install import install'" >&2
+    echo "       On Debian/Ubuntu:  sudo apt install python3-setuptools" >&2
+    exit 2
+  fi
+
+  # Killed by a signal: could be a genuinely faulty core. Continue so the
+  # per-core results identify which CPU it is.
+  echo "warning: the probe crashed unpinned (exit $rc, killed by a signal)." >&2
+  echo "         Continuing; the per-core results below show which CPU is faulty." >&2
+  echo >&2
+}
+
 run_tests() {
   local runs="$1" cpus="$2"
   local list c i f core maxg rate bad="" total_fail=0 total_runs=0 started=$SECONDS
+  local soft=0 rc=0 tested=0
 
   command -v taskset >/dev/null 2>&1 || die "taskset not found (util-linux)"
   command -v "$PYTHON" >/dev/null 2>&1 || die "python not found: $PYTHON"
@@ -196,6 +231,7 @@ run_tests() {
 
   ulimit -c 0 2>/dev/null || true
   make_probe
+  probe_selftest
   list=$(resolve_cpus "$cpus") || exit $?
 
   echo "Python: $PYTHON   runs per CPU: $runs"
@@ -212,12 +248,34 @@ run_tests() {
       continue
     fi
     f=0
+    soft=0
     for ((i = 0; i < runs; i++)); do
-      # subshell + redirect also hides bash's "Segmentation fault" noise
-      if ! ( taskset -c "$c" "$PYTHON" "$PROBE" >/dev/null 2>&1 ) 2>/dev/null; then
+      # A signal (rc >= 128) means the core crashed: hardware evidence.
+      # An ordinary non-zero exit (rc 1..127) is a Python/taskset error and
+      # must not be counted as a CPU fault. The inner shell captures the real
+      # error while the outer one swallows bash's "Segmentation fault" noise.
+      sh -c 'taskset -c "$1" "$2" "$3" 2>"$4"; exit $?' _ \
+        "$c" "$PYTHON" "$PROBE" "$ERRFILE" >/dev/null 2>/dev/null
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        continue
+      elif [ "$rc" -ge 128 ]; then
         f=$((f + 1))
+      else
+        soft=$((soft + 1))
       fi
     done
+    if [ "$soft" -gt 0 ]; then
+      echo
+      echo "error: cpu$c had $soft/$runs runs exit with an error, not a crash." >&2
+      echo "       This is a software/setup problem, not a CPU fault. First error:" >&2
+      sed 's/^/       /' "$ERRFILE" >&2
+      echo >&2
+      echo "       Run without taskset to see it directly:" >&2
+      echo "         $PYTHON $PROBE" >&2
+      exit 2
+    fi
+    tested=$((tested + 1))
     core=$(cat "$(cpu_dir "$c")/topology/core_id" 2>/dev/null || echo -)
     maxg=$(ghz "$(cat "$(freq_file "$c" scaling_max_freq)" 2>/dev/null || echo 0)")
     rate=$(awk -v f="$f" -v n="$runs" 'BEGIN { printf "%.0f%%", 100 * f / n }')
@@ -239,6 +297,11 @@ run_tests() {
   fi
 
   echo "=> Failing CPUs:$bad"
+  if [ "$tested" -gt 4 ] && [ "$total_fail" -eq "$total_runs" ]; then
+    echo "   NOTE: every run failed. That is almost always a broken probe/setup,"
+    echo "   not hardware. Check: $PYTHON $PROBE"
+    echo
+  fi
   echo "   Same code, same binary, only the pinned CPU changes: that is a hardware"
   echo "   fault, not a software bug. Try to confirm with a frequency cap:"
   echo
