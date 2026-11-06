@@ -66,7 +66,10 @@ cmd = di(d); cmd.finalize_options(); print('ok')
 | `cmd.finalize_options()` | Forces every option to resolve at once inside a deep pointer-chasing refcount loop. This is enough memory churn and pointer indirection to trip marginal silicon that pure-register math never touches. |
 | `print('ok')` | Reached only if nothing crashed, so exit code 0 means a clean run. |
 
-A corrupting core dies here with SIGSEGV / GP fault. Pure `sqrt()` loops stay
+A corrupting core either dies here with SIGSEGV / GP fault, or finishes with a
+random Python exception (`TypeError`, `AttributeError`, `NameError`,
+`SystemError`, …) because the corruption hit an object or pointer instead of a
+return address. Both outcomes are counted as failures. Pure `sqrt()` loops stay
 in vector registers and never exercise this path, which is why `stress` misses
 the fault.
 
@@ -122,11 +125,17 @@ sudo systemctl enable --now cpu-freq-cap.service
 
 ## Troubleshooting
 
-If **every** core reports 100% failure, the probe itself is not running — that
-is a setup problem, not hardware. The script runs the probe once before testing
-any core and aborts with the real Python error, and it only counts a run as a
-CPU failure when the process dies from a signal (SIGSEGV 139, SIGABRT 134, …).
-A normal Python exception is reported separately and exits 2.
+If **every** core reports 100% failure, the probe itself may not be running —
+that is a setup problem, not hardware. The script runs the probe once before
+testing any core and aborts with the real Python error if it cannot execute at
+all.
+
+During the pinned runs, a fatal signal (SIGSEGV 139, SIGABRT 134, …) and a
+random Python exception both count as a failure, because both can be caused by
+a core corrupting memory. Only a `taskset` affinity failure (for example inside
+a container that does not allow that CPU) is treated as a setup error and exits
+2. The first real error is saved and printed at the end instead of being
+overwritten by the next run.
 
 Reproduce the error by hand:
 

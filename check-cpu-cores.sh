@@ -45,11 +45,13 @@ set -u
 DEFAULT_RUNS=20
 PROBE=""
 ERRFILE=""
+FIRSTERR=""
 export PYTHON="${PYTHON:-python3}"
 
 cleanup() {
   [ -n "$PROBE" ] && rm -f "$PROBE"
   [ -n "$ERRFILE" ] && rm -f "$ERRFILE"
+  [ -n "$FIRSTERR" ] && rm -f "$FIRSTERR"
 }
 trap cleanup EXIT INT TERM
 
@@ -195,6 +197,7 @@ PY
 probe_selftest() {
   local rc
   ERRFILE=$(mktemp "${TMPDIR:-/tmp}/cpucheck.err.XXXXXX") || die "mktemp failed"
+  FIRSTERR=$(mktemp "${TMPDIR:-/tmp}/cpucheck.first.XXXXXX") || die "mktemp failed"
   sh -c '"$1" "$2" 2>"$3"; exit $?' _ "$PYTHON" "$PROBE" "$ERRFILE" \
     >/dev/null 2>/dev/null
   rc=$?
@@ -222,7 +225,8 @@ probe_selftest() {
 run_tests() {
   local runs="$1" cpus="$2"
   local list c i f core maxg rate bad="" total_fail=0 total_runs=0 started=$SECONDS
-  local soft=0 rc=0 tested=0
+  local crashes=0 corrupt=0 setup=0 rc=0 tested=0 first_saved=0 first_fail=""
+  local total_crashes=0 total_corrupt=0
 
   command -v taskset >/dev/null 2>&1 || die "taskset not found (util-linux)"
   command -v "$PYTHON" >/dev/null 2>&1 || die "python not found: $PYTHON"
@@ -248,28 +252,47 @@ run_tests() {
       continue
     fi
     f=0
-    soft=0
+    crashes=0
+    corrupt=0
+    setup=0
     for ((i = 0; i < runs; i++)); do
-      # A signal (rc >= 128) means the core crashed: hardware evidence.
-      # An ordinary non-zero exit (rc 1..127) is a Python/taskset error and
-      # must not be counted as a CPU fault. The inner shell captures the real
-      # error while the outer one swallows bash's "Segmentation fault" noise.
+      # A signal (rc >= 128) means the core crashed. A Python exception
+      # (rc 1..127) on a pinned run is corrupted execution: the unpinned
+      # self-test already proved the probe itself works. Only a taskset
+      # affinity failure is a genuine setup error. The inner shell captures
+      # the real error while the outer one swallows bash's signal noise.
       sh -c 'taskset -c "$1" "$2" "$3" 2>"$4"; exit $?' _ \
         "$c" "$PYTHON" "$PROBE" "$ERRFILE" >/dev/null 2>/dev/null
       rc=$?
-      if [ "$rc" -eq 0 ]; then
-        continue
+      [ "$rc" -eq 0 ] && continue
+
+      # Keep the first real error: ERRFILE is overwritten on each iteration.
+      if [ "$first_saved" -eq 0 ] && [ -s "$ERRFILE" ]; then
+        cp "$ERRFILE" "$FIRSTERR" && first_saved=1
+      fi
+      if [ -z "$first_fail" ]; then
+        if [ "$rc" -ge 128 ]; then
+          first_fail="killed by signal $((rc - 128)) (exit $rc)"
+        else
+          first_fail="exited $rc with a Python error"
+        fi
+      fi
+
+      if [ "$rc" -lt 128 ] && grep -q '^taskset:' "$ERRFILE" 2>/dev/null; then
+        setup=$((setup + 1))
       elif [ "$rc" -ge 128 ]; then
+        crashes=$((crashes + 1))
         f=$((f + 1))
       else
-        soft=$((soft + 1))
+        corrupt=$((corrupt + 1))
+        f=$((f + 1))
       fi
     done
-    if [ "$soft" -gt 0 ]; then
+    if [ "$setup" -gt 0 ]; then
       echo
-      echo "error: cpu$c had $soft/$runs runs exit with an error, not a crash." >&2
-      echo "       This is a software/setup problem, not a CPU fault. First error:" >&2
-      sed 's/^/       /' "$ERRFILE" >&2
+      echo "error: cpu$c could not be pinned with taskset ($setup/$runs runs)." >&2
+      echo "       This is a setup problem, not a CPU fault. First error:" >&2
+      sed 's/^/       /' "$FIRSTERR" >&2
       echo >&2
       echo "       Run without taskset to see it directly:" >&2
       echo "         $PYTHON $PROBE" >&2
@@ -281,6 +304,8 @@ run_tests() {
     rate=$(awk -v f="$f" -v n="$runs" 'BEGIN { printf "%.0f%%", 100 * f / n }')
     total_fail=$((total_fail + f))
     total_runs=$((total_runs + runs))
+    total_crashes=$((total_crashes + crashes))
+    total_corrupt=$((total_corrupt + corrupt))
     if [ "$f" -eq 0 ]; then
       printf "%-4s %-5s %-7s %-6s %-6s %-8s %s\n" "$c" "$core" "$maxg" "$runs" "$f" "$rate" "OK"
     else
@@ -290,13 +315,19 @@ run_tests() {
   done
 
   echo
-  echo "Tested $total_runs runs in $((SECONDS - started))s. Failures: $total_fail."
+  echo "Tested $total_runs runs in $((SECONDS - started))s." \
+       "Failures: $total_fail ($total_crashes signal, $total_corrupt exception)."
   if [ "$total_fail" -eq 0 ]; then
     echo "=> All tested CPUs clean."
     exit 0
   fi
 
   echo "=> Failing CPUs:$bad"
+  [ -n "$first_fail" ] && echo "   First failure: $first_fail"
+  if [ -s "$FIRSTERR" ]; then
+    echo "   First error:"
+    sed 's/^/     /' "$FIRSTERR"
+  fi
   if [ "$tested" -gt 4 ] && [ "$total_fail" -eq "$total_runs" ]; then
     echo "   NOTE: every run failed. That is almost always a broken probe/setup,"
     echo "   not hardware. Check: $PYTHON $PROBE"
